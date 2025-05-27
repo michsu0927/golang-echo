@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: © 2015 LabStack LLC and Echo contributors
+
 package middleware
 
 import (
 	"errors"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -19,7 +22,7 @@ func TestBodyDump(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 	h := func(c echo.Context) error {
-		body, err := ioutil.ReadAll(c.Request().Body)
+		body, err := io.ReadAll(c.Request().Body)
 		if err != nil {
 			return err
 		}
@@ -33,13 +36,11 @@ func TestBodyDump(t *testing.T) {
 		responseBody = string(resBody)
 	})
 
-	assert := assert.New(t)
-
-	if assert.NoError(mw(h)(c)) {
-		assert.Equal(requestBody, hw)
-		assert.Equal(responseBody, hw)
-		assert.Equal(http.StatusOK, rec.Code)
-		assert.Equal(hw, rec.Body.String())
+	if assert.NoError(t, mw(h)(c)) {
+		assert.Equal(t, requestBody, hw)
+		assert.Equal(t, responseBody, hw)
+		assert.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, hw, rec.Body.String())
 	}
 
 	// Must set default skipper
@@ -88,4 +89,54 @@ func TestBodyDumpFails(t *testing.T) {
 			t.FailNow()
 		}
 	})
+}
+
+func TestBodyDumpResponseWriter_CanNotFlush(t *testing.T) {
+	bdrw := bodyDumpResponseWriter{
+		ResponseWriter: new(testResponseWriterNoFlushHijack), // this RW does not support flush
+	}
+
+	assert.PanicsWithError(t, "response writer flushing is not supported", func() {
+		bdrw.Flush()
+	})
+}
+
+func TestBodyDumpResponseWriter_CanFlush(t *testing.T) {
+	trwu := testResponseWriterUnwrapperHijack{testResponseWriterUnwrapper: testResponseWriterUnwrapper{rw: httptest.NewRecorder()}}
+	bdrw := bodyDumpResponseWriter{
+		ResponseWriter: &trwu,
+	}
+
+	bdrw.Flush()
+	assert.Equal(t, 1, trwu.unwrapCalled)
+}
+
+func TestBodyDumpResponseWriter_CanUnwrap(t *testing.T) {
+	trwu := &testResponseWriterUnwrapper{rw: httptest.NewRecorder()}
+	bdrw := bodyDumpResponseWriter{
+		ResponseWriter: trwu,
+	}
+
+	result := bdrw.Unwrap()
+	assert.Equal(t, trwu, result)
+}
+
+func TestBodyDumpResponseWriter_CanHijack(t *testing.T) {
+	trwu := testResponseWriterUnwrapperHijack{testResponseWriterUnwrapper: testResponseWriterUnwrapper{rw: httptest.NewRecorder()}}
+	bdrw := bodyDumpResponseWriter{
+		ResponseWriter: &trwu, // this RW supports hijacking through unwrapping
+	}
+
+	_, _, err := bdrw.Hijack()
+	assert.EqualError(t, err, "can hijack")
+}
+
+func TestBodyDumpResponseWriter_CanNotHijack(t *testing.T) {
+	trwu := testResponseWriterUnwrapper{rw: httptest.NewRecorder()}
+	bdrw := bodyDumpResponseWriter{
+		ResponseWriter: &trwu, // this RW supports hijacking through unwrapping
+	}
+
+	_, _, err := bdrw.Hijack()
+	assert.EqualError(t, err, "feature not supported")
 }

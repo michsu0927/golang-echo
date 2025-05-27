@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: © 2015 LabStack LLC and Echo contributors
+
 package middleware
 
 import (
@@ -7,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -70,18 +74,18 @@ func TestLoggerIPAddress(t *testing.T) {
 	// With X-Real-IP
 	req.Header.Add(echo.HeaderXRealIP, ip)
 	h(c)
-	assert.Contains(t, ip, buf.String())
+	assert.Contains(t, buf.String(), ip)
 
 	// With X-Forwarded-For
 	buf.Reset()
 	req.Header.Del(echo.HeaderXRealIP)
 	req.Header.Add(echo.HeaderXForwardedFor, ip)
 	h(c)
-	assert.Contains(t, ip, buf.String())
+	assert.Contains(t, buf.String(), ip)
 
 	buf.Reset()
 	h(c)
-	assert.Contains(t, ip, buf.String())
+	assert.Contains(t, buf.String(), ip)
 }
 
 func TestLoggerTemplate(t *testing.T) {
@@ -91,17 +95,17 @@ func TestLoggerTemplate(t *testing.T) {
 	e.Use(LoggerWithConfig(LoggerConfig{
 		Format: `{"time":"${time_rfc3339_nano}","id":"${id}","remote_ip":"${remote_ip}","host":"${host}","user_agent":"${user_agent}",` +
 			`"method":"${method}","uri":"${uri}","status":${status}, "latency":${latency},` +
-			`"latency_human":"${latency_human}","bytes_in":${bytes_in}, "path":"${path}", "referer":"${referer}",` +
+			`"latency_human":"${latency_human}","bytes_in":${bytes_in}, "path":"${path}", "route":"${route}", "referer":"${referer}",` +
 			`"bytes_out":${bytes_out},"ch":"${header:X-Custom-Header}", "protocol":"${protocol}"` +
 			`"us":"${query:username}", "cf":"${form:username}", "session":"${cookie:session}"}` + "\n",
 		Output: buf,
 	}))
 
-	e.GET("/", func(c echo.Context) error {
+	e.GET("/users/:id", func(c echo.Context) error {
 		return c.String(http.StatusOK, "Header Logged")
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/?username=apagano-param&password=secret", nil)
+	req := httptest.NewRequest(http.MethodGet, "/users/1?username=apagano-param&password=secret", nil)
 	req.RequestURI = "/"
 	req.Header.Add(echo.HeaderXRealIP, "127.0.0.1")
 	req.Header.Add("Referer", "google.com")
@@ -126,7 +130,8 @@ func TestLoggerTemplate(t *testing.T) {
 		"hexvalue":                             false,
 		"GET":                                  true,
 		"127.0.0.1":                            true,
-		"\"path\":\"/\"":                       true,
+		"\"path\":\"/users/1\"":                true,
+		"\"route\":\"/users/:id\"":             true,
 		"\"uri\":\"/\"":                        true,
 		"\"status\":200":                       true,
 		"\"bytes_in\":0":                       true,
@@ -164,10 +169,151 @@ func TestLoggerCustomTimestamp(t *testing.T) {
 	e.ServeHTTP(rec, req)
 
 	var objs map[string]*json.RawMessage
-	if err := json.Unmarshal([]byte(buf.String()), &objs); err != nil {
+	if err := json.Unmarshal(buf.Bytes(), &objs); err != nil {
 		panic(err)
 	}
 	loggedTime := *(*string)(unsafe.Pointer(objs["time"]))
 	_, err := time.Parse(customTimeFormat, loggedTime)
 	assert.Error(t, err)
+}
+
+func TestLoggerCustomTagFunc(t *testing.T) {
+	e := echo.New()
+	buf := new(bytes.Buffer)
+	e.Use(LoggerWithConfig(LoggerConfig{
+		Format: `{"method":"${method}",${custom}}` + "\n",
+		CustomTagFunc: func(c echo.Context, buf *bytes.Buffer) (int, error) {
+			return buf.WriteString(`"tag":"my-value"`)
+		},
+		Output: buf,
+	}))
+
+	e.GET("/", func(c echo.Context) error {
+		return c.String(http.StatusOK, "custom time stamp test")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, `{"method":"GET","tag":"my-value"}`+"\n", buf.String())
+}
+
+func BenchmarkLoggerWithConfig_withoutMapFields(b *testing.B) {
+	e := echo.New()
+
+	buf := new(bytes.Buffer)
+	mw := LoggerWithConfig(LoggerConfig{
+		Format: `{"time":"${time_rfc3339_nano}","id":"${id}","remote_ip":"${remote_ip}","host":"${host}","user_agent":"${user_agent}",` +
+			`"method":"${method}","uri":"${uri}","status":${status}, "latency":${latency},` +
+			`"latency_human":"${latency_human}","bytes_in":${bytes_in}, "path":"${path}", "referer":"${referer}",` +
+			`"bytes_out":${bytes_out}, "protocol":"${protocol}"}` + "\n",
+		Output: buf,
+	})(func(c echo.Context) error {
+		c.Request().Header.Set(echo.HeaderXRequestID, "123")
+		c.FormValue("to force parse form")
+		return c.String(http.StatusTeapot, "OK")
+	})
+
+	f := make(url.Values)
+	f.Set("csrf", "token")
+	f.Add("multiple", "1")
+	f.Add("multiple", "2")
+	req := httptest.NewRequest(http.MethodPost, "/test?lang=en&checked=1&checked=2", strings.NewReader(f.Encode()))
+	req.Header.Set("Referer", "https://echo.labstack.com/")
+	req.Header.Set("User-Agent", "curl/7.68.0")
+	req.Header.Add(echo.HeaderContentType, echo.MIMEApplicationForm)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		rec := httptest.NewRecorder()
+		c := e.NewContext(req, rec)
+		mw(c)
+		buf.Reset()
+	}
+}
+
+func BenchmarkLoggerWithConfig_withMapFields(b *testing.B) {
+	e := echo.New()
+
+	buf := new(bytes.Buffer)
+	mw := LoggerWithConfig(LoggerConfig{
+		Format: `{"time":"${time_rfc3339_nano}","id":"${id}","remote_ip":"${remote_ip}","host":"${host}","user_agent":"${user_agent}",` +
+			`"method":"${method}","uri":"${uri}","status":${status}, "latency":${latency},` +
+			`"latency_human":"${latency_human}","bytes_in":${bytes_in}, "path":"${path}", "referer":"${referer}",` +
+			`"bytes_out":${bytes_out},"ch":"${header:X-Custom-Header}", "protocol":"${protocol}"` +
+			`"us":"${query:username}", "cf":"${form:csrf}", "Referer2":"${header:Referer}"}` + "\n",
+		Output: buf,
+	})(func(c echo.Context) error {
+		c.Request().Header.Set(echo.HeaderXRequestID, "123")
+		c.FormValue("to force parse form")
+		return c.String(http.StatusTeapot, "OK")
+	})
+
+	f := make(url.Values)
+	f.Set("csrf", "token")
+	f.Add("multiple", "1")
+	f.Add("multiple", "2")
+	req := httptest.NewRequest(http.MethodPost, "/test?lang=en&checked=1&checked=2", strings.NewReader(f.Encode()))
+	req.Header.Set("Referer", "https://echo.labstack.com/")
+	req.Header.Set("User-Agent", "curl/7.68.0")
+	req.Header.Add(echo.HeaderContentType, echo.MIMEApplicationForm)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		rec := httptest.NewRecorder()
+		c := e.NewContext(req, rec)
+		mw(c)
+		buf.Reset()
+	}
+}
+
+func TestLoggerTemplateWithTimeUnixMilli(t *testing.T) {
+	buf := new(bytes.Buffer)
+
+	e := echo.New()
+	e.Use(LoggerWithConfig(LoggerConfig{
+		Format: `${time_unix_milli}`,
+		Output: buf,
+	}))
+
+	e.GET("/", func(c echo.Context) error {
+		return c.String(http.StatusOK, "OK")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	unixMillis, err := strconv.ParseInt(buf.String(), 10, 64)
+	assert.NoError(t, err)
+	assert.WithinDuration(t, time.Unix(unixMillis/1000, 0), time.Now(), 3*time.Second)
+}
+
+func TestLoggerTemplateWithTimeUnixMicro(t *testing.T) {
+	buf := new(bytes.Buffer)
+
+	e := echo.New()
+	e.Use(LoggerWithConfig(LoggerConfig{
+		Format: `${time_unix_micro}`,
+		Output: buf,
+	}))
+
+	e.GET("/", func(c echo.Context) error {
+		return c.String(http.StatusOK, "OK")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	unixMicros, err := strconv.ParseInt(buf.String(), 10, 64)
+	assert.NoError(t, err)
+	assert.WithinDuration(t, time.Unix(unixMicros/1000000, 0), time.Now(), 3*time.Second)
 }
